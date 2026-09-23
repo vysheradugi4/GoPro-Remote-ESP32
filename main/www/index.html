@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GoPro Remote</title>
+  <style>
+    :root {
+      color-scheme: dark;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      background: #0f1720;
+      color: #e6edf3;
+    }
+
+    .card {
+      width: 100%;
+      max-width: 460px;
+      padding: 28px;
+      border-radius: 16px;
+      background: #17212b;
+      box-shadow: 0 18px 40px rgba(0, 0, 0, 0.45);
+    }
+
+    h1 {
+      margin: 0 0 4px;
+      font-size: 1.4rem;
+    }
+
+    h2 {
+      margin: 24px 0 10px;
+      font-size: 0.95rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #8aa0b3;
+    }
+
+    .status {
+      margin: 0 0 20px;
+      font-size: 0.95rem;
+      color: #8aa0b3;
+    }
+
+    /* Coloured dot that reflects the BLE connection state. */
+    .dot {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      margin-right: 8px;
+      border-radius: 50%;
+      background: #6b7a89;
+      vertical-align: middle;
+    }
+
+    .dot.on {
+      background: #2ecc71;
+      box-shadow: 0 0 8px #2ecc71;
+    }
+
+    .dot.busy {
+      background: #f1c40f;
+      box-shadow: 0 0 8px #f1c40f;
+    }
+
+    .dot.err {
+      background: #e74c3c;
+      box-shadow: 0 0 8px #e74c3c;
+    }
+
+    /* The control buttons stay hidden until a camera is connected. */
+    #controls {
+      display: none;
+    }
+
+    #controls.visible {
+      display: block;
+    }
+
+    .controls-row {
+      display: flex;
+      gap: 12px;
+    }
+
+    button {
+      flex: 1;
+      padding: 14px 18px;
+      border: none;
+      border-radius: 10px;
+      font-size: 1rem;
+      font-weight: 600;
+      color: #0f1720;
+      background: #58a6ff;
+      cursor: pointer;
+      transition: filter 0.15s ease;
+    }
+
+    button:hover:not(:disabled) {
+      filter: brightness(1.1);
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    button.secondary {
+      background: #30363d;
+      color: #e6edf3;
+    }
+
+    .status-grid {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px 16px;
+      margin: 0;
+    }
+
+    .status-grid dt {
+      color: #8aa0b3;
+      font-size: 0.9rem;
+    }
+
+    .status-grid dd {
+      margin: 0;
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .recording {
+      color: #e74c3c;
+      font-weight: 700;
+    }
+
+    .log {
+      margin: 16px 0 0;
+      min-height: 18px;
+      font-size: 0.85rem;
+      color: #8aa0b3;
+    }
+  </style>
+</head>
+
+<body>
+  <main class="card">
+    <h1>GoPro Remote Control</h1>
+    <p class="status"><span class="dot" id="state-dot"></span><span id="status">Starting…</span></p>
+
+    <!-- Connection buttons are always available. -->
+    <div class="controls-row">
+      <button id="connect-button" type="button">Connect</button>
+      <button id="disconnect-button" type="button" class="secondary" disabled>Disconnect</button>
+    </div>
+
+    <!-- Camera controls stay hidden until the BLE link is up. -->
+    <div id="controls">
+      <h2>Camera control</h2>
+      <div class="controls-row">
+        <button id="action-button" type="button">Action</button>
+        <button id="mode-button" type="button" class="secondary">Mode</button>
+      </div>
+      <p class="log" id="log"></p>
+    </div>
+
+    <h2>Camera status</h2>
+    <dl class="status-grid">
+      <dt>Model</dt>
+      <dd id="v-model">–</dd>
+      <dt>Device name</dt>
+      <dd id="v-device">–</dd>
+      <dt>Recording</dt>
+      <dd id="v-recording">–</dd>
+      <dt>Encoding time</dt>
+      <dd id="v-duration">–</dd>
+      <dt>Battery</dt>
+      <dd id="v-battery">–</dd>
+      <dt>SD remaining</dt>
+      <dd id="v-sd">–</dd>
+      <dt>Resolution</dt>
+      <dd id="v-resolution">–</dd>
+      <dt>Frame rate</dt>
+      <dd id="v-framerate">–</dd>
+      <dt>Lens</dt>
+      <dd id="v-lens">–</dd>
+      <dt>Flicker</dt>
+      <dd id="v-flicker">–</dd>
+      <dt>HyperSmooth</dt>
+      <dd id="v-hypersmooth">–</dd>
+      <dt>GPS</dt>
+      <dd id="v-gps">–</dd>
+      <dt>LED</dt>
+      <dd id="v-led">–</dd>
+    </dl>
+
+    <h2>Scan debug</h2>
+    <dl class="status-grid">
+      <dt>Adv. packets seen</dt>
+      <dd id="v-adv-seen">0</dd>
+      <dt>Last RSSI</dt>
+      <dd id="v-adv-rssi">–</dd>
+      <dt>Last was GoPro</dt>
+      <dd id="v-adv-gopro">–</dd>
+      <dt>Last name</dt>
+      <dd id="v-adv-name">–</dd>
+    </dl>
+  </main>
+
+  <script>
+    const statusEl = document.getElementById('status');
+    const dotEl = document.getElementById('state-dot');
+    const controlsEl = document.getElementById('controls');
+    const logEl = document.getElementById('log');
+
+    const connectBtn = document.getElementById('connect-button');
+    const disconnectBtn = document.getElementById('disconnect-button');
+    const actionBtn = document.getElementById('action-button');
+    const modeBtn = document.getElementById('mode-button');
+
+    // True while a camera command is waiting for its acknowledgement. The value
+    // comes from GET /api/status so the UI reflects the real BLE state.
+    let commandPending = false;
+
+    // POST helper used by all action endpoints.
+    async function post(path) {
+      const response = await fetch(path, { method: 'POST' });
+      if (!response.ok) {
+        throw new Error('HTTP ' + response.status);
+      }
+      return response.json().catch(() => ({}));
+    }
+
+    function setText(id, value) {
+      document.getElementById(id).textContent = value;
+    }
+
+    // Turn seconds into a compact H:MM:SS / MM:SS label.
+    function formatDuration(seconds) {
+      const s = Number(seconds) || 0;
+      const h = Math.floor(s / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      const sec = s % 60;
+      const pad = (n) => String(n).padStart(2, '0');
+      return h > 0 ? h + ':' + pad(m) + ':' + pad(sec) : pad(m) + ':' + pad(sec);
+    }
+
+    // Reflect the BLE state in the header text, dot colour and button states.
+    function applyState(state) {
+      const labels = {
+        idle: 'Idle — press Connect',
+        scanning: 'Scanning for a GoPro…',
+        connecting: 'Connecting…',
+        connected: 'Connected to GoPro',
+        disconnected: 'Disconnected — retrying',
+        failed: 'Connection failed',
+        unknown: 'Unknown state'
+      };
+      statusEl.textContent = labels[state] || labels.unknown;
+
+      dotEl.className = 'dot';
+      if (state === 'connected') {
+        dotEl.classList.add('on');
+      } else if (state === 'scanning' || state === 'connecting' || state === 'disconnected') {
+        dotEl.classList.add('busy');
+      } else if (state === 'failed') {
+        dotEl.classList.add('err');
+      }
+
+      const connected = state === 'connected';
+      // Reveal the camera control buttons only once the camera is connected.
+      controlsEl.classList.toggle('visible', connected);
+      connectBtn.disabled = connected || state === 'scanning' || state === 'connecting';
+      disconnectBtn.disabled = !connected;
+
+      // Camera buttons are usable only while connected and no command is in flight;
+      // they are re-enabled once the camera acknowledges the command.
+      actionBtn.disabled = !connected || commandPending;
+      modeBtn.disabled = !connected || commandPending;
+    }
+
+    // Render one status snapshot returned by GET /api/status.
+    function render(data) {
+      commandPending = !!data.command_pending;
+      applyState(data.state);
+
+      const known = (value, isKnown) => (isKnown ? value : '–');
+      setText('v-model', data.model || '–');
+      setText('v-device', data.device || '–');
+
+      const recordingEl = document.getElementById('v-recording');
+      recordingEl.textContent = data.recording ? 'REC' : 'Idle';
+      recordingEl.className = data.recording ? 'recording' : '';
+
+      setText('v-duration', formatDuration(data.encoding_duration));
+      setText('v-battery', data.battery >= 0 ? data.battery + '%' : '–');
+      setText('v-sd', data.sd_remaining > 0 ? formatDuration(data.sd_remaining) : '–');
+      setText('v-resolution', known(data.resolution, data.resolution_known));
+      setText('v-framerate', known(data.framerate, data.framerate_known));
+      setText('v-lens', known(data.lens, data.lens_known));
+      setText('v-flicker', known(data.flicker, data.flicker_known));
+      setText('v-hypersmooth', known(data.hypersmooth, data.hypersmooth_known));
+      setText('v-gps', known(data.gps, data.gps_known));
+      setText('v-led', known(data.led, data.led_known));
+
+      // Diagnostics from the BLE scanner.
+      setText('v-adv-seen', data.adv_seen != null ? data.adv_seen : 0);
+      setText('v-adv-rssi', data.last_adv_rssi != null ? data.last_adv_rssi + ' dBm' : '–');
+      setText('v-adv-gopro', data.last_adv_is_gopro ? 'Yes' : 'No');
+      setText('v-adv-name', data.last_adv_name || '–');
+    }
+
+    // Poll the camera status and keep the page in sync.
+    async function refresh() {
+      try {
+        const response = await fetch('/api/status', { cache: 'no-store' });
+        render(await response.json());
+      } catch (error) {
+        applyState('failed');
+        statusEl.textContent = 'Connection to the remote lost';
+      }
+    }
+
+    // Run a connection endpoint and show the result in the log line.
+    async function action(path, label) {
+      logEl.textContent = label + '…';
+      try {
+        await post(path);
+        logEl.textContent = label + ' sent';
+      } catch (error) {
+        logEl.textContent = 'Error: ' + error.message;
+      } finally {
+        await refresh();
+      }
+    }
+
+    // Run a camera command and wait for the camera to acknowledge it so the
+    // buttons can be re-enabled for the next press.
+    async function cameraAction(path, label) {
+      commandPending = true;
+      actionBtn.disabled = true;
+      modeBtn.disabled = true;
+      logEl.textContent = label + '…';
+      try {
+        await post(path);
+        logEl.textContent = label + ' sent';
+
+        // Poll until the camera answers, giving up after a few seconds so the
+        // UI never stays stuck if the response is lost.
+        const deadline = Date.now() + 6000;
+        while (Date.now() < deadline) {
+          const response = await fetch('/api/status', { cache: 'no-store' });
+          const data = await response.json();
+          render(data);
+          if (!data.command_pending) {
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 300));
+        }
+      } catch (error) {
+        logEl.textContent = 'Error: ' + error.message;
+      } finally {
+        await refresh();
+      }
+    }
+
+    connectBtn.addEventListener('click', () => action('/api/connect', 'Connect'));
+    disconnectBtn.addEventListener('click', () => action('/api/disconnect', 'Disconnect'));
+    actionBtn.addEventListener('click', () => cameraAction('/api/shutter', 'Action'));
+    modeBtn.addEventListener('click', () => cameraAction('/api/mode', 'Mode'));
+
+    refresh();
+    setInterval(refresh, 2000);
+  </script>
+</body>
+
+</html>

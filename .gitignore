@@ -1,0 +1,4 @@
+# Arduino/PlatformIO-style build artefacts
+build/
+sdkconfig
+sdkconfig.old

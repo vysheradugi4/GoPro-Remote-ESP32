@@ -1,0 +1,86 @@
+menu "GoPro Remote configuration"
+
+    choice WIFI_MODE
+        prompt "Wi-Fi mode"
+        default WIFI_MODE_AP
+        help
+            AP  — the ESP32 creates its own soft access point.
+                  Connect to it and open http://192.168.4.1
+            STA — the ESP32 joins an existing Wi-Fi network.
+                  The assigned address is printed in the log (UART port).
+
+        config WIFI_MODE_AP
+            bool "Access point (SoftAP)"
+
+        config WIFI_MODE_STA
+            bool "Client (Station)"
+    endchoice
+
+    config WIFI_AP_SSID
+        string "Access point SSID"
+        depends on WIFI_MODE_AP
+        default "ESP32-WebServer"
+
+    config WIFI_AP_PASSWORD
+        string "Access point password (empty = open network)"
+        depends on WIFI_MODE_AP
+        default "12345678"
+
+    config WIFI_AP_CHANNEL
+        int "Access point channel"
+        depends on WIFI_MODE_AP
+        range 1 13
+        default 1
+
+    config WIFI_STA_SSID
+        string "Network SSID"
+        depends on WIFI_MODE_STA
+        default ""
+
+    config WIFI_STA_PASSWORD
+        string "Network password"
+        depends on WIFI_MODE_STA
+        default ""
+
+    config HTTP_PORT
+        int "HTTP server port"
+        range 1 65535
+        default 80
+
+    config GOPRO_ONBOARD_LED
+        bool "Use an onboard LED as a BLE connection indicator"
+        default y
+        help
+            Light an LED while the ESP32 is connected to the GoPro over BLE.
+
+    choice GOPRO_ONBOARD_LED_TYPE
+        prompt "Onboard LED type"
+        depends on GOPRO_ONBOARD_LED
+        default GOPRO_ONBOARD_LED_TYPE_WS2812
+        help
+            WS2812 — an addressable RGB LED (typical on ESP32-C3 devkits).
+            GPIO   — a plain LED driven directly by a GPIO.
+
+        config GOPRO_ONBOARD_LED_TYPE_WS2812
+            bool "Addressable WS2812 (RGB)"
+
+        config GOPRO_ONBOARD_LED_TYPE_GPIO
+            bool "Plain GPIO LED"
+    endchoice
+
+    config GOPRO_ONBOARD_LED_GPIO
+        int "Onboard LED GPIO"
+        depends on GOPRO_ONBOARD_LED
+        default 8
+        help
+            GPIO the LED is wired to. GPIO8 is the RGB LED on most ESP32-C3
+            devkits; change it if your board uses a different pin.
+
+    config GOPRO_ONBOARD_LED_ACTIVE_LOW
+        bool "Plain LED is active low"
+        depends on GOPRO_ONBOARD_LED && GOPRO_ONBOARD_LED_TYPE_GPIO
+        default n
+        help
+            Enable when the plain GPIO LED lights up on a low logic level.
+
+endmenu
