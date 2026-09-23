@@ -180,6 +180,8 @@
       <dd id="v-model">–</dd>
       <dt>Device name</dt>
       <dd id="v-device">–</dd>
+      <dt>Mode</dt>
+      <dd id="v-mode">–</dd>
       <dt>Recording</dt>
       <dd id="v-recording">–</dd>
       <dt>Encoding time</dt>
@@ -297,6 +299,7 @@
       const known = (value, isKnown) => (isKnown ? value : '–');
       setText('v-model', data.model || '–');
       setText('v-device', data.device || '–');
+      setText('v-mode', known(data.mode, data.mode_known));
 
       const recordingEl = document.getElementById('v-recording');
       recordingEl.textContent = data.recording ? 'REC' : 'Idle';
@@ -380,7 +383,9 @@
     modeBtn.addEventListener('click', () => cameraAction('/api/mode', 'Mode'));
 
     refresh();
-    setInterval(refresh, 2000);
+    // Poll quickly so the camera controls appear right after the link is up
+    // instead of waiting up to a full second for the next refresh.
+    setInterval(refresh, 400);
   </script>
 </body>
 

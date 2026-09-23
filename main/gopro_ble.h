@@ -60,6 +60,8 @@ struct Status {
     uint32_t gps_raw;
     bool led_known;
     uint32_t led_raw;
+    bool preset_group_known;   // Current UI mode group has been reported.
+    uint32_t preset_group;     // 1000 video / 1001 photo / 1002 timelapse.
     char device_name[32];      // BLE advertised name of the camera.
 
     // Diagnostics: helps to understand what the scanner actually sees.

@@ -35,10 +35,30 @@
 #include "freertos/semphr.h"
 #include "sdkconfig.h"
 
+// ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+// Logging is compiled out for now: the ESP_LOG* calls stay in the source but
+// expand to nothing, which keeps the code easy to restore while saving power
+// and code size in the battery-powered build. Define GOPRO_ENABLE_LOGS to bring
+// every log line back.
+#ifndef GOPRO_ENABLE_LOGS
+#undef ESP_LOGE
+#undef ESP_LOGW
+#undef ESP_LOGI
+#undef ESP_LOGD
+#undef ESP_LOGV
+#define ESP_LOGE(tag, format, ...) ((void)0)
+#define ESP_LOGW(tag, format, ...) ((void)0)
+#define ESP_LOGI(tag, format, ...) ((void)0)
+#define ESP_LOGD(tag, format, ...) ((void)0)
+#define ESP_LOGV(tag, format, ...) ((void)0)
+#endif
+
 namespace gopro {
 namespace {
 
-constexpr const char *TAG = "gopro_ble";
+[[maybe_unused]] constexpr const char *TAG = "gopro_ble";
 
 // ---------------------------------------------------------------------------
 // GP-Control service and characteristics
@@ -108,6 +128,9 @@ enum StatusId : uint8_t {
     STATUS_ENCODING_DURATION = 13,
     STATUS_SD_REMAINING = 35,
     STATUS_BATTERY = 70,
+    // Current preset group / UI mode: an Int32ub (1000 video, 1001 photo,
+    // 1002 timelapse). Reported whenever the camera changes mode.
+    STATUS_PRESET_GROUP = 96,
 };
 
 // Query/response opcodes.
@@ -152,6 +175,24 @@ const char *const kModelNames[kModelTableSize] = {
 constexpr uint16_t kConnIdInvalid = 0xFFFF;
 constexpr int64_t kKeepAlivePeriodUs = 15LL * 1000 * 1000;  // 15 s
 
+// Scanning runs in short sessions: scan for a moment, then rest for a while,
+// and repeat. The radio (and the CPU feeding it) is idle most of the time, so
+// this is markedly cheaper on the battery than a continuous scan.
+constexpr uint32_t kScanSessionSeconds = 1;                 // 1 s per session.
+// Keep the rest between sessions short: while the user is actively asking to
+// connect, a long pause is pure added latency (the radio is only idle anyway
+// once the scan session ends), so 300 ms is a good latency/battery trade-off.
+constexpr int64_t kScanSessionPauseUs = 300LL * 1000;       // 300 ms between sessions.
+
+// Preferred connection parameters (units of 1.25 ms), requested right before the
+// link is opened. 15 ms / 30 ms with no slave latency is the price/quality
+// compromise: responsive enough to wake the camera quickly, without paying for
+// the most power-hungry 7.5 ms interval.
+constexpr uint16_t kPreferredConnIntMin = 12;    // 15 ms
+constexpr uint16_t kPreferredConnIntMax = 24;    // 30 ms
+constexpr uint16_t kPreferredConnLatency = 0;
+constexpr uint16_t kPreferredConnTimeout = 600;  // 6 s supervision timeout
+
 SemaphoreHandle_t s_mutex = nullptr;
 
 esp_gatt_if_t s_gattc_if = ESP_GATT_IF_NONE;
@@ -166,6 +207,7 @@ int64_t s_command_sent_us = 0;   // When the pending command was sent.
 
 esp_timer_handle_t s_keepalive_timer = nullptr;
 esp_timer_handle_t s_reconnect_timer = nullptr;
+esp_timer_handle_t s_scan_resume_timer = nullptr;
 
 // Notification reassembly buffer for chunked query responses.
 uint8_t s_reply_buf[512];
@@ -218,7 +260,12 @@ void led_channel_init()
 }
 
 // Drive a single WS2812 (data MSB first as GRB). Timings are for a 10 MHz RMT
-// clock: T0H 0.3us / T0L 0.9us, T1H 0.6us / T1L 0.6us.
+// clock (1 tick = 0.1 us) and match the WS2812B datasheet:
+//   bit 0 -> T0H 0.4 us / T0L 0.9 us   (4 / 9 ticks)
+//   bit 1 -> T1H 0.8 us / T1L 0.4 us   (8 / 4 ticks)
+// The old ones used T1H = 0.6 us, below the WS2812B minimum of ~0.65 us, so the
+// chip misjudged the bits: the "off" pattern never latched and the LED just
+// stayed lit instead of blinking. Keep the pulses inside the datasheet window.
 void led_set(bool on)
 {
     if (s_led_chan == nullptr || s_led_encoder == nullptr) {
@@ -231,22 +278,31 @@ void led_set(bool on)
             rmt_symbol_word_t &sym = s_led_symbols[idx++];
             const bool one = ((grb[byte] >> bit) & 1) != 0;
             sym.level0 = 1;
-            sym.duration0 = one ? 6 : 3;
+            sym.duration0 = one ? 8 : 4;
             sym.level1 = 0;
-            sym.duration1 = one ? 6 : 9;
+            sym.duration1 = one ? 4 : 9;
         }
     }
-    s_led_symbols[idx].level0 = 0;   // Reset: keep the line low long enough.
-    s_led_symbols[idx].duration0 = 700;
+    // Reset / latch pulse: the WS2812 needs the data line held low for >= 50 us
+    // to latch the frame. Both halves must have a non-zero duration - a symbol
+    // with a zero-length half makes the copy encoder emit a truncated frame, so
+    // the "off" colour never latched and the LED stayed lit instead of blinking.
+    // 400 + 400 ticks at 0.1 us/tick = 80 us low, comfortably above the minimum.
+    s_led_symbols[idx].level0 = 0;
+    s_led_symbols[idx].duration0 = 400;
     s_led_symbols[idx].level1 = 0;
-    s_led_symbols[idx].duration1 = 0;
+    s_led_symbols[idx].duration1 = 400;
     idx++;
 
     rmt_transmit_config_t tx_cfg = {};
     tx_cfg.loop_count = 0;
-    rmt_transmit(s_led_chan, s_led_encoder, s_led_symbols,
-                 idx * sizeof(rmt_symbol_word_t), &tx_cfg);
-    rmt_tx_wait_all_done(s_led_chan, portMAX_DELAY);
+    tx_cfg.flags.eot_level = 0;  // Idle low after the frame (keeps the latch).
+    if (rmt_transmit(s_led_chan, s_led_encoder, s_led_symbols,
+                     idx * sizeof(rmt_symbol_word_t), &tx_cfg) == ESP_OK) {
+        // Bounded wait: never block the shared esp_timer task (which also drives
+        // the blink toggle and the keep-alive) with portMAX_DELAY.
+        rmt_tx_wait_all_done(s_led_chan, 100);
+    }
 }
 
 #else  // A plain LED wired to a GPIO.
@@ -553,6 +609,7 @@ void register_for_updates()
 
     const uint8_t status_ids[] = {
         STATUS_ENCODING, STATUS_ENCODING_DURATION, STATUS_BATTERY, STATUS_SD_REMAINING,
+        STATUS_PRESET_GROUP,
     };
     for (uint8_t id : status_ids) {
         const uint8_t payload[2] = {QUERY_REGISTER_STATUS, id};
@@ -772,6 +829,16 @@ void on_receive_status(uint8_t id, const uint8_t *value, size_t length)
     case STATUS_BATTERY:
         s_status.battery_percent = value[0];
         break;
+    case STATUS_PRESET_GROUP:
+        if (length >= 4) {
+            s_status.preset_group_known = true;
+            s_status.preset_group =
+                (static_cast<uint32_t>(value[0]) << 24) |
+                (static_cast<uint32_t>(value[1]) << 16) |
+                (static_cast<uint32_t>(value[2]) << 8) |
+                static_cast<uint32_t>(value[3]);
+        }
+        break;
     default:
         break;
     }
@@ -903,8 +970,10 @@ void configure_and_scan()
 void start_scan()
 {
     set_state(State::Scanning);
-    // Duration 0 means scan until stopped explicitly.
-    esp_ble_gap_start_scanning(0);
+    // Short sessions instead of a continuous scan: the stack stops by itself
+    // after kScanSessionSeconds and ESP_GAP_BLE_SCAN_STOP_COMPLETE_EVT schedules
+    // the next session after a pause, so the radio rests between bursts.
+    esp_ble_gap_start_scanning(kScanSessionSeconds);
 }
 
 void on_scan_result(esp_ble_gap_cb_param_t *param)
@@ -966,6 +1035,13 @@ void on_scan_result(esp_ble_gap_cb_param_t *param)
 
     ESP_LOGI(TAG, "GoPro found: %s (%s), connecting...", name,
              model_id_string(s_status.model_id));
+
+    // Request the preferred connection interval before opening the link (the
+    // parameter only takes effect in the master role and only before connecting).
+    esp_ble_gap_set_prefer_conn_params(s_remote_bda, kPreferredConnIntMin,
+                                       kPreferredConnIntMax, kPreferredConnLatency,
+                                       kPreferredConnTimeout);
+
     esp_ble_gap_stop_scanning();
     esp_ble_gattc_open(s_gattc_if, s_remote_bda, addr_type, true);
 }
@@ -1177,6 +1253,21 @@ void gap_event_handler(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *par
         }
         break;
 
+    case ESP_GAP_BLE_SCAN_STOP_COMPLETE_EVT:
+        // A scan session ended. If we are still looking for the camera, wait a
+        // bit and start the next session; if we stopped in order to connect the
+        // state is no longer Scanning and we leave the radio idle.
+        {
+            lock();
+            const State state = s_status.state;
+            unlock();
+            if (state == State::Scanning && s_scan_resume_timer != nullptr) {
+                esp_timer_stop(s_scan_resume_timer);
+                esp_timer_start_once(s_scan_resume_timer, kScanSessionPauseUs);
+            }
+        }
+        break;
+
     case ESP_GAP_BLE_SCAN_RESULT_EVT:
         on_scan_result(param);
         break;
@@ -1200,6 +1291,12 @@ void keepalive_timer_cb(void *)
 }
 
 void reconnect_timer_cb(void *)
+{
+    start_scan_if_needed();
+}
+
+// Fires after the pause between two scan sessions and starts the next one.
+void scan_resume_timer_cb(void *)
 {
     start_scan_if_needed();
 }
@@ -1266,6 +1363,15 @@ void init()
     };
     ESP_ERROR_CHECK(esp_timer_create(&reconnect_args, &s_reconnect_timer));
 
+    const esp_timer_create_args_t scan_resume_args = {
+        .callback = &scan_resume_timer_cb,
+        .arg = nullptr,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "gopro_scan",
+        .skip_unhandled_events = false,
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&scan_resume_args, &s_scan_resume_timer));
+
     // Scan parameters are applied once the GATT app is registered.
     ESP_LOGI(TAG, "BLE client initialised");
 }
@@ -1289,6 +1395,7 @@ void disconnect()
     lock();
     s_auto_reconnect = false;
     const uint16_t conn_id = s_conn_id;
+    const State state = s_status.state;
     unlock();
 
     if (s_keepalive_timer != nullptr) {
@@ -1296,6 +1403,13 @@ void disconnect()
     }
     if (s_reconnect_timer != nullptr) {
         esp_timer_stop(s_reconnect_timer);
+    }
+    if (s_scan_resume_timer != nullptr) {
+        esp_timer_stop(s_scan_resume_timer);
+    }
+    if (state == State::Scanning) {
+        // Drop the radio out of the scan session we may be in the middle of.
+        esp_ble_gap_stop_scanning();
     }
     if (conn_id != kConnIdInvalid) {
         esp_ble_gattc_close(s_gattc_if, conn_id);
@@ -1315,10 +1429,25 @@ void shutter()
 
 void next_mode()
 {
-    // Cycle through the video / photo / timelapse preset groups. The camera keeps
-    // its own presets; we only ask it to switch to another group.
-    const uint16_t group = kPresetGroups[s_preset_group_index];
-    s_preset_group_index = (s_preset_group_index + 1) % kPresetGroupCount;
+    // Cycle through the video / photo / timelapse preset groups. When the camera
+    // has reported its current group we advance relative to it, so the button
+    // stays in sync even if the mode was changed on the camera itself.
+    lock();
+    const bool known = s_status.preset_group_known;
+    const uint32_t current = s_status.preset_group;
+    unlock();
+
+    int index = s_preset_group_index;
+    if (known) {
+        for (int i = 0; i < kPresetGroupCount; ++i) {
+            if (kPresetGroups[i] == current) {
+                index = (i + 1) % kPresetGroupCount;
+                break;
+            }
+        }
+    }
+    s_preset_group_index = (index + 1) % kPresetGroupCount;
+    const uint16_t group = kPresetGroups[index];
     ESP_LOGI(TAG, "Loading preset group %u", static_cast<unsigned>(group));
 
     // LOAD_PRESET_GROUP takes an unsigned 16-bit big-endian preset group id.
@@ -1361,6 +1490,17 @@ const char *state_string(State state)
     }
 }
 
+// Human readable name for the preset group reported by the camera.
+const char *preset_group_label(uint32_t group)
+{
+    switch (group) {
+    case 1000: return "Video";
+    case 1001: return "Photo";
+    case 1002: return "Timelapse";
+    default: return "-";
+    }
+}
+
 int status_json(char *buf, size_t buf_size)
 {
     Status st = {};
@@ -1378,6 +1518,8 @@ int status_json(char *buf, size_t buf_size)
         "\"connected\":%s,"
         "\"model\":\"%s\","
         "\"device\":\"%s\","
+        "\"mode\":\"%s\","
+        "\"mode_known\":%s,"
         "\"recording\":%s,"
         "\"encoding_duration\":%u,"
         "\"battery\":%d,"
@@ -1406,6 +1548,8 @@ int status_json(char *buf, size_t buf_size)
         (st.state == State::Connected) ? "true" : "false",
         model_id_string(st.model_id),
         st.device_name,
+        st.preset_group_known ? preset_group_label(st.preset_group) : "-",
+        st.preset_group_known ? "true" : "false",
         st.encoding ? "true" : "false",
         static_cast<unsigned>(st.encoding_duration),
         st.battery_percent,
